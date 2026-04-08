@@ -1,9 +1,31 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+@app.options("/transcript")
+async def options_transcript():
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        }
+    )
 
 class TranscriptRequest(BaseModel):
     url: str
@@ -33,12 +55,10 @@ def get_transcript(req: TranscriptRequest):
 
     ytt = YouTubeTranscriptApi()
 
-    # 한국어 우선 → 영어 → 자동생성 순서로 시도
     try:
         transcript = ytt.fetch(video_id, languages=["ko", "en"])
     except Exception:
         try:
-            # 사용 가능한 자막 중 첫 번째 사용
             transcript_list = ytt.list(video_id)
             first = next(iter(transcript_list))
             transcript = first.fetch()
