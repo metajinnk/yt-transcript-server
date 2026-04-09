@@ -1,25 +1,27 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi
 import re
+import subprocess
+import json
+import tempfile
+import os
 
 app = FastAPI()
 
-def cors_headers():
-    return {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Accept",
-    }
+def cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
 
 @app.middleware("http")
 async def add_cors(request: Request, call_next):
     if request.method == "OPTIONS":
-        return JSONResponse(content={}, headers=cors_headers())
+        r = JSONResponse({})
+        return cors(r)
     response = await call_next(request)
-    for k, v in cors_headers().items():
-        response.headers[k] = v
+    cors(response)
     return response
 
 class TranscriptRequest(BaseModel):
@@ -38,29 +40,89 @@ def get_video_id(url: str) -> str:
 
 @app.get("/")
 def root():
-    return JSONResponse({"status": "ok"}, headers=cors_headers())
+    return JSONResponse({"status": "ok", "message": "YouTube Transcript Server (yt-dlp)"})
 
 @app.post("/transcript")
 def get_transcript(req: TranscriptRequest):
     try:
         video_id = get_video_id(req.url)
     except ValueError as e:
-        return JSONResponse({"detail": str(e)}, status_code=400, headers=cors_headers())
+        return JSONResponse({"detail": str(e)}, status_code=400)
 
-    ytt = YouTubeTranscriptApi()
-    try:
-        transcript = ytt.fetch(video_id, languages=["ko", "en"])
-    except Exception:
-        try:
-            first = next(iter(ytt.list(video_id)))
-            transcript = first.fetch()
-        except Exception as e:
-            return JSONResponse({"detail": f"자막을 찾을 수 없습니다: {e}"}, status_code=404, headers=cors_headers())
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = os.path.join(tmpdir, "%(id)s.%(ext)s")
+        cmd = [
+            "yt-dlp",
+            "--write-auto-sub",
+            "--write-sub",
+            "--sub-lang", "ko,en",
+            "--sub-format", "json3",
+            "--skip-download",
+            "--no-warnings",
+            "-o", out_path,
+            f"https://www.youtube.com/watch?v={video_id}"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
-    full_text = " ".join([t.text for t in transcript])
-    return JSONResponse({
-        "video_id": video_id,
-        "url": req.url,
-        "transcript": full_text,
-        "char_count": len(full_text)
-    }, headers=cors_headers())
+        # 자막 파일 찾기
+        sub_file = None
+        for fname in os.listdir(tmpdir):
+            if fname.endswith(".json3"):
+                sub_file = os.path.join(tmpdir, fname)
+                break
+
+        if not sub_file:
+            # vtt 시도
+            cmd2 = [
+                "yt-dlp",
+                "--write-auto-sub",
+                "--write-sub",
+                "--sub-lang", "ko,en",
+                "--sub-format", "vtt",
+                "--skip-download",
+                "--no-warnings",
+                "-o", out_path,
+                f"https://www.youtube.com/watch?v={video_id}"
+            ]
+            subprocess.run(cmd2, capture_output=True, text=True, timeout=60)
+            for fname in os.listdir(tmpdir):
+                if fname.endswith(".vtt"):
+                    sub_file = os.path.join(tmpdir, fname)
+                    break
+
+        if not sub_file:
+            return JSONResponse({
+                "detail": f"자막을 찾을 수 없습니다. stderr: {result.stderr[:500]}"
+            }, status_code=404)
+
+        with open(sub_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # VTT 파싱
+        if sub_file.endswith(".vtt"):
+            lines = content.split("\n")
+            texts = []
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith("WEBVTT") or "-->" in line or line.startswith("NOTE"):
+                    continue
+                # 중복 제거
+                if texts and texts[-1] == line:
+                    continue
+                texts.append(line)
+            full_text = " ".join(texts)
+        else:
+            # json3 파싱
+            try:
+                data = json.loads(content)
+                texts = [e.get("segs", [{}])[0].get("utf8", "") for e in data.get("events", []) if e.get("segs")]
+                full_text = " ".join(t for t in texts if t.strip() and t != "\n")
+            except Exception:
+                full_text = content
+
+        return JSONResponse({
+            "video_id": video_id,
+            "url": req.url,
+            "transcript": full_text.strip(),
+            "char_count": len(full_text.strip())
+        })
